@@ -1,6 +1,6 @@
 use super::shard::ShardStore;
 use crate::core::types::{proto, Height};
-use crate::proto::snapchain::{Block, ShardChunk};
+use crate::proto::snapchain::{Block, ShardChunk, Transaction};
 use crate::proto::{message, snapchain};
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use crate::storage::store::BlockStore;
@@ -104,38 +104,45 @@ impl ShardEngine {
         trie: &mut merkle_trie::MerkleTrie,
         db: &RocksDB,
         txn_batch: &mut RocksDbTransactionBatch,
-        shard_chunk: ShardChunk,
+        transactions: &[Transaction],
+        shard_root: &[u8],
     ) -> bool {
-        let shard_root = shard_chunk.header.unwrap().shard_root;
-
         let mut hashes: Vec<Vec<u8>> = vec![];
-        for msg in &shard_chunk.transactions[0].user_messages {
+        for msg in &transactions[0].user_messages {
             hashes.push(msg.hash.clone());
         }
 
         trie.insert(db, txn_batch, hashes.clone()).unwrap();
         let root1 = trie.root_hash().unwrap();
 
-        &root1 == &shard_root
+        &root1 == shard_root
     }
 
     pub fn validate_state_change(&mut self, shard_state_change: &ShardStateChange) -> bool {
-        // TODO: actually validate
+        let mut txn = RocksDbTransactionBatch::new();
 
-        // Create a db transaction
-        // Replay the state change
-        // If all messages merge successfully and the merkle trie root matches the stateroot in the state change, return true
-        // Else return false
-        // Rollback the transaction
-        true // TODO
+        let transactions = &shard_state_change.transactions;
+        let shard_root = &shard_state_change.new_state_root;
+
+        let hashes_match = {
+            let db = &*self.shard_store.db;
+            Self::replay(&mut self.trie, db, &mut txn, transactions, shard_root)
+        };
+
+        self.trie.reload(&*self.shard_store.db).unwrap();
+
+        hashes_match
     }
 
     pub fn commit_shard_chunk(&mut self, shard_chunk: ShardChunk) {
         let mut txn = RocksDbTransactionBatch::new();
 
+        let shard_root = &shard_chunk.header.as_ref().unwrap().shard_root;
+        let transactions = &shard_chunk.transactions;
+
         let hashes_match = {
             let db = &*self.shard_store.db;
-            Self::replay(&mut self.trie, db, &mut txn, shard_chunk.clone())
+            Self::replay(&mut self.trie, db, &mut txn, transactions, &shard_root)
         };
 
         if hashes_match {
@@ -146,14 +153,8 @@ impl ShardEngine {
             panic!("hashes don't match");
         }
 
-        self.trie.reload(&*self.shard_store.db).unwrap(); // Reload trie after immutable borrow ends.
+        self.trie.reload(&*self.shard_store.db).unwrap();
 
-        // Create a db transaction
-        // Replay the state change
-        // If the state root does not match or any of the messages fail to merge, panic?
-        // write the events to the db
-        // Commit the transaction
-        // Emit events
         match self.shard_store.put_shard_chunk(shard_chunk) {
             Err(err) => {
                 error!("Unable to write shard chunk to store {}", err)
