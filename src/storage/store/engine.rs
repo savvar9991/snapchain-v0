@@ -2,7 +2,7 @@ use super::shard::ShardStore;
 use crate::core::types::{proto, Height};
 use crate::proto::snapchain::{Block, ShardChunk};
 use crate::proto::{message, snapchain};
-use crate::storage::db::RocksDbTransactionBatch;
+use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
 use crate::storage::store::BlockStore;
 use crate::storage::trie::merkle_trie;
 use std::iter;
@@ -82,25 +82,11 @@ impl ShardEngine {
             user_messages,
         }];
 
-        warn!(
-            shard,
-            insert = encode_vec(&hashes.clone()),
-            "propose – before insert",
-        );
-
         let db = &*self.shard_store.db;
 
         let mut txn_batch = RocksDbTransactionBatch::new();
         self.trie.insert(db, &mut txn_batch, hashes);
         let new_root_hash = self.trie.root_hash().unwrap();
-        let count = self.trie.items().unwrap();
-
-        warn!(
-            shard,
-            new_state_root = hex::encode(&new_root_hash),
-            count,
-            "propose - after insert"
-        );
 
         let result = ShardStateChange {
             shard_id: shard,
@@ -111,22 +97,26 @@ impl ShardEngine {
         // TODO: this should probably operate automatically via drop trait
         self.trie.reload(db).unwrap();
 
-        warn!(
-            shard,
-            reloaded_root_hash = hex::encode(&self.trie.root_hash().unwrap()),
-            count,
-            "propose - reloaded"
-        );
-
         result
+    }
 
-        // TODO:
-        // Create a db transaction
-        // For each user message, add to the store and merkle trie
-        // Evict invalid messages from the mempool
-        // Construct a ShardStateChange with the valid transactions and the new state root
-        // Rollback the transaction
-        // Return the state change
+    fn replay(
+        trie: &mut merkle_trie::MerkleTrie,
+        db: &RocksDB,
+        txn_batch: &mut RocksDbTransactionBatch,
+        shard_chunk: ShardChunk,
+    ) -> bool {
+        let shard_root = shard_chunk.header.unwrap().shard_root;
+
+        let mut hashes: Vec<Vec<u8>> = vec![];
+        for msg in &shard_chunk.transactions[0].user_messages {
+            hashes.push(msg.hash.clone());
+        }
+
+        trie.insert(db, txn_batch, hashes.clone()).unwrap();
+        let root1 = trie.root_hash().unwrap();
+
+        &root1 == &shard_root
     }
 
     pub fn validate_state_change(&mut self, shard_state_change: &ShardStateChange) -> bool {
@@ -141,51 +131,22 @@ impl ShardEngine {
     }
 
     pub fn commit_shard_chunk(&mut self, shard_chunk: ShardChunk) {
-        let shard_root = shard_chunk.clone().header.unwrap().shard_root; // TODO: without clone?
+        let mut txn = RocksDbTransactionBatch::new();
 
-        let mut hashes: Vec<Vec<u8>> = vec![];
-        // TODO! don't assume 1 transaction
-        for msg in &shard_chunk.transactions[0].user_messages {
-            hashes.push(msg.hash.clone());
-        }
-
-        let root0 = self.trie.root_hash().unwrap();
-
-        warn!(
-            state_root_0 = hex::encode(&root0),
-            insert = encode_vec(&hashes),
-            "commit insert"
-        );
-
-        let db = &*self.shard_store.db;
-
-        let mut txn_batch = RocksDbTransactionBatch::new();
-
-        self.trie
-            .insert(db, &mut txn_batch, hashes.clone())
-            .unwrap();
-        let root1 = self.trie.root_hash().unwrap();
-
-        let hashes_match = &root1 == &shard_root;
-
-        warn!(
-            hashes_match,
-            state_root_0 = hex::encode(&root0),
-            state_root_1 = hex::encode(&root1),
-            shard_root = hex::encode(shard_root.clone()),
-            "commit 1"
-        );
+        let hashes_match = {
+            let db = &*self.shard_store.db;
+            Self::replay(&mut self.trie, db, &mut txn, shard_chunk.clone())
+        };
 
         if hashes_match {
-            db.commit(txn_batch).unwrap();
-            self.trie.reload(db).unwrap();
-            let committed_root = self.trie.root_hash().unwrap();
-
-            error!(committed_root = hex::encode(committed_root), "commit!");
+            let db = &*self.shard_store.db;
+            db.commit(txn).unwrap();
         } else {
             error!("panic!");
-            panic!("hashes don't match")
+            panic!("hashes don't match");
         }
+
+        self.trie.reload(&*self.shard_store.db).unwrap(); // Reload trie after immutable borrow ends.
 
         // Create a db transaction
         // Replay the state change
