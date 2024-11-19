@@ -112,7 +112,7 @@ impl ShardEngine {
             hashes.push(msg.hash.clone());
         }
 
-        trie.insert(db, txn_batch, hashes.clone()).unwrap();
+        trie.insert(db, txn_batch, hashes).unwrap();
         let root1 = trie.root_hash().unwrap();
 
         &root1 == shard_root
